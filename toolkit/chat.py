@@ -544,7 +544,7 @@ def run_chat(
     )
     print(
         _style(
-            "Drag & drop image files into the prompt (or /image <path>) • /help for commands • \"\"\" multiline • Ctrl+D exit.\n",
+            "Drag & drop image files into the prompt (or /image <path>) • /help for commands • \"\"\" multiline • Ctrl+C/Ctrl+D exit.\n",
             DIM,
             sys.stdout,
         )
@@ -642,12 +642,9 @@ def run_chat(
                 badge = f"[{len(staged_images)} img] " if staged_images else ""
                 prompt_label = _style(f"{badge}you> ", GREEN + BOLD, sys.stdout)
                 line = input(prompt_label)
-            except EOFError:
+            except (EOFError, KeyboardInterrupt):
                 print()
                 break
-            except KeyboardInterrupt:
-                print()
-                continue
 
             stripped = line.strip()
             if not stripped:
