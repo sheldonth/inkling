@@ -11,6 +11,7 @@ from unittest import mock
 
 from toolkit.chat import (
     StreamPrinter,
+    _readline_prompt,
     _save_transcript,
     build_direct_command,
     build_user_message_content,
@@ -428,6 +429,23 @@ class ChatAndCLITests(unittest.TestCase):
             cmd_direct = build_direct_command(cfg, images=[mmproj])
             self.assertIn("--mmproj", cmd_direct)
             self.assertIn("--image", cmd_direct)
+
+    def test_readline_prompt_safe_for_libedit_and_gnu(self) -> None:
+        class FakeTTY:
+            def isatty(self) -> bool:
+                return True
+
+        tty = FakeTTY()
+        with mock.patch("toolkit.chat._is_libedit", return_value=True):
+            prompt_editline = _readline_prompt("you> ", stream=tty)
+            self.assertEqual(prompt_editline, "you> ")
+            self.assertNotIn("\033", prompt_editline)
+
+        with mock.patch("toolkit.chat._is_libedit", return_value=False):
+            prompt_gnu = _readline_prompt("you> ", stream=tty)
+            self.assertIn("\001", prompt_gnu)
+            self.assertIn("\002", prompt_gnu)
+            self.assertIn("you> ", prompt_gnu)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,29 @@ def _style(text: str, code: str, stream: Any) -> str:
     return f"{code}{text}{RESET}"
 
 
+def _is_libedit() -> bool:
+    if readline is None:
+        return False
+    backend = getattr(readline, "backend", "")
+    if backend == "editline":
+        return True
+    return "libedit" in (readline.__doc__ or "").lower()
+
+
+def _readline_prompt(label: str, code: str = GREEN + BOLD, stream: Any = None) -> str:
+    """Format a prompt string safely for Python's readline/libedit `input()`."""
+    target = sys.stdout if stream is None else stream
+    if not _use_color(target):
+        return label
+    # macOS Python uses libedit, whose screen-refresh logic miscalculates column width
+    # and corrupts Up-arrow history recall (leaving stray `[0m` artifacts) whenever ANSI
+    # escape sequences appear inside the `input()` prompt string.
+    if _is_libedit():
+        return label
+    # GNU readline requires non-printing escapes to be wrapped in \001...\002.
+    return f"\001{code}\002{label}\001{RESET}\002"
+
+
 def format_stats(result: ChatResult) -> str:
     t = result.timings or {}
     parts: list[str] = []
@@ -95,7 +118,7 @@ class StreamPrinter:
         if not self._in_thinking:
             self._in_thinking = True
             self._saw_thinking = True
-            header = _style("[thinking]\n", DIM + ITALIC, target)
+            header = _style("[thinking]\n", DIM, target)
             target.write(header)
         target.write(_style(chunk, DIM, target))
         target.flush()
@@ -105,7 +128,7 @@ class StreamPrinter:
             return
         if self._in_thinking:
             target = self.stderr if self.piped else self.stdout
-            target.write(_style("\n[/thinking]\n\n", DIM + ITALIC, target))
+            target.write(_style("\n[/thinking]\n\n", DIM, target))
             target.flush()
             self._in_thinking = False
         self._saw_content = True
@@ -115,7 +138,7 @@ class StreamPrinter:
     def finish(self) -> None:
         if self._in_thinking:
             target = self.stderr if self.piped else self.stdout
-            target.write(_style("\n[/thinking]\n", DIM + ITALIC, target))
+            target.write(_style("\n[/thinking]\n", DIM, target))
             target.flush()
             self._in_thinking = False
         if self._saw_content:
@@ -640,7 +663,7 @@ def run_chat(
         while True:
             try:
                 badge = f"[{len(staged_images)} img] " if staged_images else ""
-                prompt_label = _style(f"{badge}you> ", GREEN + BOLD, sys.stdout)
+                prompt_label = _readline_prompt(f"{badge}you> ", GREEN + BOLD, sys.stdout)
                 line = input(prompt_label)
             except (EOFError, KeyboardInterrupt):
                 print()
