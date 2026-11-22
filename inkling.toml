@@ -1,0 +1,54 @@
+# Configuration for the Inkling-2-Mini abliterated local LLM toolkit.
+# Relative paths are resolved against the directory containing this file.
+
+[paths]
+model = "Inkling-2-Mini-Q8_0.gguf"
+lora = "Inkling-2-Mini-Uncensored-LoRA.gguf"
+llama_cli = "llama.cpp/build/bin/llama-cli"
+llama_server = "llama.cpp/build/bin/llama-server"
+harness_dir = "harness"
+harness_bin = "harness/target/release/inkling-code"
+state_dir = ".inkling"
+
+[lora]
+# Applied dynamically at runtime via --lora-scaled (1.0 = abliterated, 0.0 = base model).
+# On a running server you can also adjust this live via `inkling lora <scale|on|off>`.
+scale = 1.0
+
+[server]
+host = "127.0.0.1"
+port = 9931
+alias = "inkling-abliterated"
+# Context window tokens (0 = let llama.cpp auto-fit to available Metal memory).
+ctx_size = 65536
+gpu_layers = "all"
+flash_attn = "auto"
+parallel = 1
+cache_ram = 8192
+webui = true
+# Automatically start the background server when running `ask`, `chat`, or `ui`.
+auto_start = true
+startup_timeout = 180
+# Extra arguments passed directly to llama-server (e.g. ["--cache-type-k", "q8_0"]).
+extra_args = []
+
+[generation]
+# Inkling-2-Mini chat template effort levels:
+#   default, none, minimal, low, medium, high, xhigh, max
+reasoning_effort = "medium"
+temperature = 1.0
+top_p = 0.95
+top_k = 40
+min_p = 0.05
+# -1 = unlimited (model decides when to stop)
+max_tokens = -1
+system_prompt = ""
+show_thinking = true
+show_stats = false
+
+[direct]
+# Defaults for standalone `inkling direct` (runs llama-cli directly with no background server).
+ctx_size = 32768
+gpu_layers = "all"
+flash_attn = "auto"
+extra_args = []

@@ -1,0 +1,31 @@
+# Model weights & LoRA adapters (never commit multi-GB GGUF files)
+*.gguf
+*.bin
+*.safetensors
+*.npz
+*.pt
+*.pth
+
+# Rust build artifacts (keep harness/Cargo.lock committed for reproducible builds)
+/harness/target/
+
+# Local toolkit runtime state (PID, server.log, REPL history)
+/.inkling/
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Optional local bin symlink folder
+/local/
+
+# macOS & editor files
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
