@@ -29,6 +29,7 @@ class ConfigError(RuntimeError):
 class PathsConfig:
     model: Path
     lora: Path
+    mmproj: Path | None
     llama_cli: Path
     llama_server: Path
     harness_dir: Path
@@ -127,6 +128,26 @@ def _resolve_path(raw: str | Path, base_dir: Path) -> Path:
     return (base_dir / path).resolve()
 
 
+def _detect_mmproj(base_dir: Path) -> Path | None:
+    """Auto-detect an mmproj GGUF file in the repository root if present."""
+    if not base_dir.is_dir():
+        return None
+    candidates = sorted(
+        p for p in base_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".gguf" and "mmproj" in p.name.lower()
+    )
+    return candidates[0].resolve() if candidates else None
+
+
+def _resolve_optional_path(raw: str | Path | None, base_dir: Path) -> Path | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    return _resolve_path(text, base_dir)
+
+
 def _parse_bool(raw: str) -> bool:
     lowered = raw.strip().lower()
     if lowered in ("1", "true", "yes", "on"):
@@ -178,6 +199,13 @@ def load_config(
     gen_tbl = raw.get("generation", {})
     direct_tbl = raw.get("direct", {})
 
+    mmproj_raw = environ.get("INKLING_MMPROJ")
+    if mmproj_raw is None:
+        mmproj_raw = paths_tbl.get("mmproj", "")
+    mmproj_path = _resolve_optional_path(mmproj_raw, base_dir)
+    if mmproj_path is None:
+        mmproj_path = _detect_mmproj(base_dir)
+
     paths = PathsConfig(
         model=_resolve_path(
             environ.get("INKLING_MODEL") or paths_tbl.get("model", "Inkling-2-Mini-Q8_0.gguf"),
@@ -187,6 +215,7 @@ def load_config(
             environ.get("INKLING_LORA") or paths_tbl.get("lora", "Inkling-2-Mini-Uncensored-LoRA.gguf"),
             base_dir,
         ),
+        mmproj=mmproj_path,
         llama_cli=_resolve_path(
             environ.get("INKLING_LLAMA_CLI") or paths_tbl.get("llama_cli", "llama.cpp/build/bin/llama-cli"),
             base_dir,

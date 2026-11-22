@@ -56,6 +56,8 @@ def build_server_command(
     lora_scale: float | None = None,
     base_only: bool = False,
     no_lora: bool = False,
+    mmproj: Path | None = None,
+    no_mmproj: bool = False,
     reasoning_effort: str | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -123,6 +125,11 @@ def build_server_command(
             cmd.extend(["--lora", str(cfg.paths.lora), "--lora-init-without-apply"])
         else:
             cmd.extend(["--lora-scaled", f"{cfg.paths.lora}:{effective_scale:g}"])
+
+    if not no_mmproj:
+        use_mmproj = mmproj if mmproj is not None else cfg.paths.mmproj
+        if use_mmproj is not None:
+            cmd.extend(["--mmproj", str(use_mmproj)])
 
     if cfg.server.api_key:
         cmd.extend(["--api-key", cfg.server.api_key])
@@ -319,6 +326,8 @@ def start_server(
     lora_scale: float | None = None,
     base_only: bool = False,
     no_lora: bool = False,
+    mmproj: Path | None = None,
+    no_mmproj: bool = False,
     reasoning_effort: str | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -331,6 +340,9 @@ def start_server(
     ensure_file_exists(cfg.paths.model, "Model GGUF")
     if not no_lora:
         ensure_file_exists(cfg.paths.lora, "LoRA adapter GGUF")
+    effective_mmproj = None if no_mmproj else (mmproj if mmproj is not None else cfg.paths.mmproj)
+    if effective_mmproj is not None:
+        ensure_file_exists(effective_mmproj, "Vision projector (mmproj) GGUF")
 
     use_host = host if host is not None else cfg.server.host
     use_port = port if port is not None else cfg.server.port
@@ -373,6 +385,8 @@ def start_server(
         lora_scale=lora_scale,
         base_only=base_only,
         no_lora=no_lora,
+        mmproj=mmproj,
+        no_mmproj=no_mmproj,
         reasoning_effort=reasoning_effort,
         temperature=temperature,
         top_p=top_p,
@@ -417,6 +431,7 @@ def start_server(
             "alias": alias or cfg.server.alias,
             "model": str(cfg.paths.model),
             "lora": None if no_lora else str(cfg.paths.lora),
+            "mmproj": str(effective_mmproj) if effective_mmproj is not None else None,
             "initial_lora_scale": effective_scale,
             "started_at": time.time(),
             "log_file": str(cfg.log_file),

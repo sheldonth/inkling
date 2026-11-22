@@ -4,6 +4,8 @@
 [paths]
 model = "Inkling-2-Mini-Q8_0.gguf"
 lora = "Inkling-2-Mini-Uncensored-LoRA.gguf"
+# Optional vision projector GGUF for image inputs (leave empty to auto-detect *mmproj*.gguf in repo root).
+mmproj = ""
 llama_cli = "llama.cpp/build/bin/llama-cli"
 llama_server = "llama.cpp/build/bin/llama-server"
 harness_dir = "harness"

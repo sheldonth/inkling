@@ -13,7 +13,10 @@ from toolkit.chat import (
     StreamPrinter,
     _save_transcript,
     build_direct_command,
+    build_user_message_content,
     compose_user_prompt,
+    extract_dropped_images,
+    parse_image_path_token,
     parse_lora_scale_arg,
 )
 from toolkit.cli import build_parser, main
@@ -363,6 +366,68 @@ class ChatAndCLITests(unittest.TestCase):
             p.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
             tail = read_log_tail(p, lines=5).splitlines()
             self.assertEqual(tail, ["line 95", "line 96", "line 97", "line 98", "line 99"])
+
+    def test_drag_and_drop_image_extraction_and_multimodal_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            img1 = tmp_path / "Screenshot 2026-11-21 at 7.36 PM.png"
+            img2 = tmp_path / "diagram.jpg"
+            # Minimal valid-ish bytes for base64 encoding check
+            img1.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+            img2.write_bytes(b"\xff\xd8\xff\xe0fake")
+
+            # 1. macOS backslash-escaped drag-and-drop path alone
+            escaped = str(img1).replace(" ", r"\ ")
+            rem, imgs = extract_dropped_images(escaped)
+            self.assertEqual(rem, "")
+            self.assertEqual(imgs, [img1.resolve()])
+
+            # 2. Inline image + prose with an unmatched apostrophe ("don't")
+            rem2, imgs2 = extract_dropped_images(f"don't miss {escaped} or '{img2}' please")
+            self.assertEqual(rem2, "don't miss or please")
+            self.assertEqual(imgs2, [img1.resolve(), img2.resolve()])
+
+            # 3. file:// URI form
+            uri = f"file://{str(img2)}"
+            self.assertEqual(parse_image_path_token(uri), img2.resolve())
+
+            # 4. Non-existent path stays untouched as text
+            rem3, imgs3 = extract_dropped_images("/tmp/does-not-exist-12345.png hello")
+            self.assertEqual(imgs3, [])
+            self.assertIn("does-not-exist-12345.png", rem3)
+
+            # 5. OpenAI multimodal content payload & Markdown export
+            content = build_user_message_content("What is this?", [img1])
+            self.assertIsInstance(content, list)
+            self.assertEqual(content[0]["type"], "image_url")
+            self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+            self.assertEqual(content[1], {"type": "text", "text": "What is this?"})
+
+            md_path = tmp_path / "transcript.md"
+            _save_transcript(md_path, [{"role": "user", "content": content}])
+            md_text = md_path.read_text(encoding="utf-8")
+            self.assertIn("_[attached image]_", md_text)
+            self.assertIn("What is this?", md_text)
+            self.assertNotIn("base64,", md_text)
+
+    def test_mmproj_auto_detection_and_server_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            mmproj = tmp_path / "mmproj-Inkling-2-Mini-F16.gguf"
+            mmproj.write_bytes(b"GGUF")
+            cfg = load_config(tmp_path, env={})
+            self.assertEqual(cfg.paths.mmproj, mmproj.resolve())
+
+            cmd = build_server_command(cfg)
+            self.assertIn("--mmproj", cmd)
+            self.assertEqual(cmd[cmd.index("--mmproj") + 1], str(mmproj.resolve()))
+
+            cmd_no = build_server_command(cfg, no_mmproj=True)
+            self.assertNotIn("--mmproj", cmd_no)
+
+            cmd_direct = build_direct_command(cfg, images=[mmproj])
+            self.assertIn("--mmproj", cmd_direct)
+            self.assertIn("--image", cmd_direct)
 
 
 if __name__ == "__main__":

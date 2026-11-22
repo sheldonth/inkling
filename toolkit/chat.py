@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 try:
     import readline
@@ -118,6 +123,191 @@ class StreamPrinter:
             self.stdout.flush()
 
 
+IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".tga",
+        ".webp",
+        ".heic",
+        ".heif",
+        ".tif",
+        ".tiff",
+    }
+)
+SIPS_CONVERT_EXTENSIONS: frozenset[str] = frozenset(
+    {".heic", ".heif", ".webp", ".tif", ".tiff"}
+)
+_SHELL_UNESCAPE_RE = re.compile(r"\\(.)")
+
+
+def _format_size(num_bytes: int) -> str:
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{num_bytes} B"
+
+
+def _scan_shell_tokens(text: str) -> list[tuple[int, int, str]]:
+    """Scan whitespace-delimited tokens while respecting quotes and backslash-escaped spaces."""
+    tokens: list[tuple[int, int, str]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        if text[i] in ("'", '"'):
+            quote = text[i]
+            end_quote = text.find(quote, i + 1)
+            if end_quote != -1:
+                i = end_quote + 1
+                tokens.append((start, i, text[start:i]))
+                continue
+        while i < n and not text[i].isspace():
+            if text[i] == "\\" and i + 1 < n:
+                i += 2
+            else:
+                i += 1
+        tokens.append((start, i, text[start:i]))
+    return tokens
+
+
+def parse_image_path_token(raw_token: str) -> Path | None:
+    """Resolve a terminal-pasted / drag-and-dropped token to an existing image Path if valid."""
+    token = raw_token.strip()
+    if not token:
+        return None
+
+    # Strip matching outer quotes if present.
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        candidate = token[1:-1]
+    else:
+        # Unescape macOS terminal drag-and-drop backslash escapes (e.g. `\ `, `\(`, `\'`).
+        candidate = _SHELL_UNESCAPE_RE.sub(r"\1", token)
+
+    if candidate.startswith("file://"):
+        parsed = urlparse(candidate)
+        if parsed.scheme == "file":
+            candidate = unquote(parsed.path)
+
+    if not candidate:
+        return None
+
+    path = Path(candidate).expanduser()
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return None
+    try:
+        if path.is_file():
+            return path.resolve()
+    except OSError:
+        return None
+    return None
+
+
+def extract_dropped_images(raw_text: str) -> tuple[str, list[Path]]:
+    """Extract existing drag-and-dropped image paths from user input, returning (remaining_text, images)."""
+    tokens = _scan_shell_tokens(raw_text)
+    images: list[Path] = []
+    remove_spans: list[tuple[int, int]] = []
+
+    for start, end, tok in tokens:
+        img = parse_image_path_token(tok)
+        if img is not None:
+            images.append(img)
+            remove_spans.append((start, end))
+
+    if not remove_spans:
+        return raw_text, []
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in remove_spans:
+        pieces.append(raw_text[cursor:start])
+        cursor = end
+    pieces.append(raw_text[cursor:])
+    remaining = re.sub(r"[ \t]{2,}", " ", "".join(pieces)).strip()
+    return remaining, images
+
+
+def encode_image_data_url(path: Path) -> tuple[str, int]:
+    """Read an image file (auto-converting HEIC/WebP/TIFF via macOS sips if needed) into a data URL."""
+    if not path.is_file():
+        raise ConfigError(f"Image file not found: {path}")
+
+    ext = path.suffix.lower()
+    raw_bytes: bytes
+    mime: str
+
+    if ext in SIPS_CONVERT_EXTENSIONS and sys.platform == "darwin" and Path("/usr/bin/sips").is_file():
+        with tempfile.TemporaryDirectory() as tmp:
+            out_png = Path(tmp) / "converted.png"
+            proc = subprocess.run(
+                ["/usr/bin/sips", "-s", "format", "png", str(path), "--out", str(out_png)],
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0 and out_png.is_file():
+                raw_bytes = out_png.read_bytes()
+                mime = "image/png"
+            else:
+                raw_bytes = path.read_bytes()
+                mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    else:
+        raw_bytes = path.read_bytes()
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+
+    encoded = base64.b64encode(raw_bytes).decode("ascii")
+    return f"data:{mime};base64,{encoded}", len(raw_bytes)
+
+
+def build_user_message_content(text: str, images: list[Path]) -> str | list[dict[str, Any]]:
+    """Build OpenAI chat content: plain string for text-only, or multimodal array with image_url parts."""
+    if not images:
+        return text
+
+    parts: list[dict[str, Any]] = []
+    for img_path in images:
+        data_url, _ = encode_image_data_url(img_path)
+        parts.append({"type": "image_url", "image_url": {"url": data_url}})
+    if text.strip():
+        parts.append({"type": "text", "text": text})
+    return parts
+
+
+def _server_supports_vision(client: ServerClient, props: dict[str, Any] | None = None) -> bool:
+    data = props
+    if data is None:
+        try:
+            data = client.props(timeout=3.0)
+        except ServerClientError:
+            return False
+    modalities = data.get("modalities")
+    if isinstance(modalities, dict):
+        return bool(modalities.get("vision", False))
+    return False
+
+
+def _vision_missing_message(cfg: AppConfig) -> str:
+    if cfg.paths.mmproj is not None and cfg.paths.mmproj.is_file():
+        return (
+            "The running llama-server does not have vision enabled yet, even though an mmproj file is configured "
+            f"({cfg.paths.mmproj.name}).\n"
+            "Restart the server to load it: `inkling restart`"
+        )
+    return (
+        "Image input requires Inkling-2-Mini's vision projector (`mmproj`) GGUF, which is not loaded on llama-server.\n"
+        f"Drop an `*mmproj*.gguf` file into {cfg.repo_root} (or set `paths.mmproj` in inkling.toml), "
+        "then run `inkling restart`."
+    )
+
+
 def compose_user_prompt(
     prompt_text: str,
     *,
@@ -159,6 +349,7 @@ def run_ask(
     *,
     prompt: str = "",
     files: list[Path] | None = None,
+    images: list[Path] | None = None,
     system: str | None = None,
     effort: str | None = None,
     lora_scale: float | None = None,
@@ -176,19 +367,26 @@ def run_ask(
     auto_start: bool | None = None,
     direct: bool = False,
 ) -> int:
-    """Run a single-turn completion (supports positional prompt, -f files, and stdin piping)."""
+    """Run a single-turn completion (supports positional prompt, -f files, -i images, and stdin piping)."""
     stdin_text: str | None = None
     if not sys.stdin.isatty():
         stdin_text = sys.stdin.read()
 
-    full_prompt = compose_user_prompt(prompt, stdin_text=stdin_text, files=files)
-    if not full_prompt:
-        raise ConfigError("No prompt provided. Pass a prompt argument, -f FILE, or pipe text via stdin.")
+    cleaned_prompt, dropped_images = extract_dropped_images(prompt)
+    all_images: list[Path] = list(images or [])
+    for img in dropped_images:
+        if img not in all_images:
+            all_images.append(img)
+
+    full_prompt = compose_user_prompt(cleaned_prompt, stdin_text=stdin_text, files=files)
+    if not full_prompt and not all_images:
+        raise ConfigError("No prompt provided. Pass a prompt argument, -f FILE, -i IMAGE, or pipe text via stdin.")
 
     if direct:
         return run_direct(
             cfg,
-            prompt=full_prompt,
+            prompt=full_prompt or "Describe this image.",
+            images=all_images,
             system=system,
             effort=effort,
             lora_scale=lora_scale,
@@ -206,11 +404,14 @@ def run_ask(
     status = ensure_server_running(cfg, auto_start=auto_start)
     client = ServerClient(status.base_url, api_key=cfg.server.api_key)
 
+    if all_images and not _server_supports_vision(client, status.props):
+        raise ServerError(_vision_missing_message(cfg))
+
     messages: list[dict[str, Any]] = []
     use_system = cfg.generation.system_prompt if system is None else system
     if use_system:
         messages.append({"role": "system", "content": use_system})
-    messages.append({"role": "user", "content": full_prompt})
+    messages.append({"role": "user", "content": build_user_message_content(full_prompt, all_images)})
 
     use_effort = validate_effort(effort) if effort is not None else cfg.generation.reasoning_effort
     effective_lora = 0.0 if base_only else lora_scale
@@ -282,6 +483,7 @@ def run_chat(
     cfg: AppConfig,
     *,
     system: str | None = None,
+    images: list[Path] | None = None,
     effort: str | None = None,
     lora_scale: float | None = None,
     base_only: bool = False,
@@ -305,6 +507,7 @@ def run_chat(
             attach=True,
             attach_url=status.base_url,
             system=system,
+            images=images,
             prompt=initial_prompt,
         )
 
@@ -332,14 +535,32 @@ def run_chat(
 
     server_lora = _current_server_lora_scale(client)
     active_scale = server_lora if session_lora is None else session_lora
+    has_vision = _server_supports_vision(client, status.props)
+    vision_tag = "on" if has_vision else "off (no mmproj)"
     print(
         _style("Inkling-2-Mini", BOLD + CYAN, sys.stdout)
-        + f"  server={status.base_url}  lora={format_lora_status(active_scale)}  effort={session_effort}"
+        + f"  server={status.base_url}  lora={format_lora_status(active_scale)}  "
+        + f"effort={session_effort}  vision={vision_tag}"
     )
-    print(_style("Type /help for commands, \"\"\" for multiline, Ctrl+C to cancel generation, Ctrl+D to exit.\n", DIM, sys.stdout))
+    print(
+        _style(
+            "Drag & drop image files into the prompt (or /image <path>) • /help for commands • \"\"\" multiline • Ctrl+D exit.\n",
+            DIM,
+            sys.stdout,
+        )
+    )
 
     messages: list[dict[str, Any]] = []
     staged_files: list[Path] = []
+    staged_images: list[Path] = []
+
+    for img_path in images or []:
+        if not img_path.is_file():
+            raise ConfigError(f"Image file not found: {img_path}")
+        staged_images.append(img_path.resolve())
+        print(f"Staged image: {img_path.name} ({_format_size(img_path.stat().st_size)})")
+    if staged_images:
+        print()
 
     def build_messages() -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -347,6 +568,32 @@ def run_chat(
             out.append({"role": "system", "content": session_system})
         out.extend(messages)
         return out
+
+    def check_vision_ready() -> bool:
+        nonlocal has_vision
+        if has_vision:
+            return True
+        # Re-check /props once in case the user restarted llama-server with mmproj.
+        has_vision = _server_supports_vision(client)
+        if not has_vision:
+            print(_style(f"\n{_vision_missing_message(cfg)}\n", YELLOW, sys.stderr), file=sys.stderr)
+            return False
+        return True
+
+    def send_user_turn(text: str) -> None:
+        nonlocal staged_files, staged_images
+        if staged_images and not check_vision_ready():
+            return
+        user_text = compose_user_prompt(text, files=staged_files)
+        try:
+            content = build_user_message_content(user_text, staged_images)
+        except ConfigError as exc:
+            print(_style(f"{exc}\n", YELLOW, sys.stderr), file=sys.stderr)
+            return
+        staged_files.clear()
+        staged_images.clear()
+        messages.append({"role": "user", "content": content})
+        send_turn()
 
     def send_turn() -> None:
         printer = StreamPrinter(show_thinking=session_thinking, piped=False)
@@ -384,13 +631,16 @@ def run_chat(
         print()
 
     if initial_prompt:
-        messages.append({"role": "user", "content": initial_prompt})
-        send_turn()
+        cleaned_init, dropped_init = extract_dropped_images(initial_prompt)
+        for img in dropped_init:
+            staged_images.append(img)
+        send_user_turn(cleaned_init)
 
     try:
         while True:
             try:
-                prompt_label = _style("you> ", GREEN + BOLD, sys.stdout)
+                badge = f"[{len(staged_images)} img] " if staged_images else ""
+                prompt_label = _style(f"{badge}you> ", GREEN + BOLD, sys.stdout)
                 line = input(prompt_label)
             except EOFError:
                 print()
@@ -400,7 +650,9 @@ def run_chat(
                 continue
 
             stripped = line.strip()
-            if not stripped and not staged_files:
+            if not stripped:
+                if staged_images or staged_files:
+                    send_user_turn("")
                 continue
 
             if stripped in ("\"\"\"", "/multiline"):
@@ -414,16 +666,47 @@ def run_chat(
                     if ml.strip() == "\"\"\"":
                         break
                     buf.append(ml)
-                stripped = "\n".join(buf).strip()
-                if not stripped and not staged_files:
+                raw_ml = "\n".join(buf).strip()
+                cleaned_ml, dropped_ml = extract_dropped_images(raw_ml)
+                for img in dropped_ml:
+                    staged_images.append(img)
+                    print(f"Attached image: {img.name} ({_format_size(img.stat().st_size)})")
+                if not cleaned_ml and not staged_files and not staged_images:
                     continue
-                user_text = compose_user_prompt(stripped, files=staged_files)
-                staged_files.clear()
-                messages.append({"role": "user", "content": user_text})
-                send_turn()
+                send_user_turn(cleaned_ml)
                 continue
 
-            if stripped.startswith("/"):
+            # Check for drag-and-dropped image path(s) BEFORE slash-command dispatch,
+            # because macOS absolute paths start with `/`.
+            cleaned_line, dropped_imgs = extract_dropped_images(line)
+            if dropped_imgs:
+                for img in dropped_imgs:
+                    staged_images.append(img)
+                    print(
+                        _style(
+                            f"Attached image: {img.name} ({_format_size(img.stat().st_size)})",
+                            CYAN,
+                            sys.stdout,
+                        )
+                    )
+                if not has_vision:
+                    has_vision = _server_supports_vision(client)
+                    if not has_vision:
+                        print(_style(f"{_vision_missing_message(cfg)}\n", YELLOW, sys.stderr), file=sys.stderr)
+                if not cleaned_line.strip():
+                    print(
+                        _style(
+                            f"  [{len(staged_images)} image(s) staged — type your question, drop more images, or press Enter to send]\n",
+                            DIM,
+                            sys.stdout,
+                        )
+                    )
+                    continue
+                send_user_turn(cleaned_line)
+                continue
+
+            first_tok = stripped.split(maxsplit=1)[0]
+            if stripped.startswith("/") and "/" not in first_tok[1:]:
                 parts = stripped.split(maxsplit=1)
                 cmd = parts[0].lower()
                 arg = parts[1].strip() if len(parts) > 1 else ""
@@ -433,6 +716,8 @@ def run_chat(
                 if cmd == "/help":
                     print(
                         "Commands:\n"
+                        "  /image <path>               Attach an image (or drag & drop directly into prompt)\n"
+                        "  /images [clear]             List or clear staged images\n"
                         "  /lora [scale|on|off|base|inherit|global <scale>]  Adjust abliteration LoRA scale\n"
                         "  /effort [default|none|minimal|low|medium|high|xhigh|max]\n"
                         "  /thinking [on|off]          Toggle reasoning output display\n"
@@ -440,7 +725,7 @@ def run_chat(
                         "  /temp [float]               Show or set sampling temperature\n"
                         "  /max-tokens [int]           Show or set max tokens (-1 = unlimited)\n"
                         "  /system [text|clear]        Show, set, or clear system prompt\n"
-                        "  /read <file>                Attach file to next message\n"
+                        "  /read <file>                Attach text file to next message\n"
                         "  /multiline (or \"\"\")        Enter multiline input\n"
                         "  /regen                      Regenerate last assistant reply\n"
                         "  /undo                       Remove last user+assistant exchange\n"
@@ -450,9 +735,49 @@ def run_chat(
                         "  /exit                       Quit chat\n"
                     )
                     continue
+                if cmd == "/image":
+                    if not arg:
+                        print(_style("Usage: /image <path-to-image>\n", YELLOW, sys.stdout))
+                        continue
+                    img = parse_image_path_token(arg)
+                    if img is None:
+                        print(
+                            _style(
+                                f"Not a valid existing image file: {arg}\n"
+                                f"Supported formats: {', '.join(sorted(IMAGE_EXTENSIONS))}\n",
+                                YELLOW,
+                                sys.stdout,
+                            )
+                        )
+                        continue
+                    staged_images.append(img)
+                    print(
+                        _style(
+                            f"Staged image: {img.name} ({_format_size(img.stat().st_size)}) [{len(staged_images)} staged]\n",
+                            CYAN,
+                            sys.stdout,
+                        )
+                    )
+                    if not has_vision:
+                        has_vision = _server_supports_vision(client)
+                        if not has_vision:
+                            print(_style(f"{_vision_missing_message(cfg)}\n", YELLOW, sys.stderr), file=sys.stderr)
+                    continue
+                if cmd == "/images":
+                    if arg.lower() == "clear":
+                        staged_images.clear()
+                        print(_style("Cleared staged images.\n", DIM, sys.stdout))
+                    elif not staged_images:
+                        print("No staged images.\n")
+                    else:
+                        for idx, img in enumerate(staged_images, 1):
+                            print(f"  {idx}. {img} ({_format_size(img.stat().st_size)})")
+                        print()
+                    continue
                 if cmd == "/clear":
                     messages.clear()
                     staged_files.clear()
+                    staged_images.clear()
                     print(_style("Conversation cleared.\n", DIM, sys.stdout))
                     continue
                 if cmd == "/undo":
@@ -580,22 +905,20 @@ def run_chat(
                     print(
                         f"Server:   {status.base_url}\n"
                         f"Model:    {cfg.server.alias}\n"
+                        f"Vision:   {'enabled' if _server_supports_vision(client) else 'disabled (no mmproj)'}\n"
                         f"LoRA:     {format_lora_status(eff_lora)}"
                         + (" (session override)" if session_lora is not None else " (server global)")
                         + f"\nEffort:   {session_effort}\n"
                         f"Temp:     {session_temp:g} | top_p={session_top_p:g} | min_p={session_min_p:g}\n"
                         f"Thinking: {'on' if session_thinking else 'off'} | Stats: {'on' if session_stats else 'off'}\n"
-                        f"Turns:    {len(messages)} messages\n"
+                        f"Turns:    {len(messages)} messages | Staged images: {len(staged_images)}\n"
                     )
                     continue
 
                 print(_style(f"Unknown command: {cmd}. Type /help for options.\n", YELLOW, sys.stdout))
                 continue
 
-            user_text = compose_user_prompt(line, files=staged_files)
-            staged_files.clear()
-            messages.append({"role": "user", "content": user_text})
-            send_turn()
+            send_user_turn(line)
     finally:
         if readline is not None:
             try:
@@ -618,7 +941,15 @@ def _save_transcript(path: Path, messages: list[dict[str, Any]]) -> None:
         lines.append(f"## {role}\n")
         if msg.get("reasoning_content"):
             lines.append(f"<details><summary>Thinking</summary>\n\n{msg['reasoning_content']}\n\n</details>\n")
-        lines.append(f"{msg.get('content', '')}\n")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    lines.append("_[attached image]_\n")
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    lines.append(f"{part.get('text', '')}\n")
+        else:
+            lines.append(f"{content}\n")
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -642,10 +973,13 @@ def build_direct_command(
     attach: bool = False,
     attach_url: str | None = None,
     prompt: str | None = None,
+    images: list[Path] | None = None,
     system: str | None = None,
     effort: str | None = None,
     lora_scale: float | None = None,
     base_only: bool = False,
+    mmproj: Path | None = None,
+    no_mmproj: bool = False,
     ctx_size: int | None = None,
     gpu_layers: str | None = None,
     flash_attn: str | None = None,
@@ -710,9 +1044,17 @@ def build_direct_command(
         if abs(effective_scale) >= 1e-6:
             cmd.extend(["--lora-scaled", f"{cfg.paths.lora}:{effective_scale:g}"])
 
+        if not no_mmproj:
+            use_mmproj = mmproj if mmproj is not None else cfg.paths.mmproj
+            if use_mmproj is not None:
+                cmd.extend(["--mmproj", str(use_mmproj)])
+
     use_system = cfg.generation.system_prompt if system is None else system
     if use_system:
         cmd.extend(["--system-prompt", use_system])
+
+    if images:
+        cmd.extend(["--image", ",".join(str(p) for p in images)])
 
     if prompt:
         cmd.extend(["--prompt", prompt])
@@ -736,10 +1078,13 @@ def run_direct(
     attach_url: str | None = None,
     allow_duplicate: bool = False,
     prompt: str | None = None,
+    images: list[Path] | None = None,
     system: str | None = None,
     effort: str | None = None,
     lora_scale: float | None = None,
     base_only: bool = False,
+    mmproj: Path | None = None,
+    no_mmproj: bool = False,
     ctx_size: int | None = None,
     gpu_layers: str | None = None,
     flash_attn: str | None = None,
@@ -761,6 +1106,9 @@ def run_direct(
         effective_scale = 0.0 if base_only else (cfg.lora.scale if lora_scale is None else float(lora_scale))
         if abs(effective_scale) >= 1e-6:
             ensure_file_exists(cfg.paths.lora, "LoRA adapter GGUF")
+        effective_mmproj = None if no_mmproj else (mmproj if mmproj is not None else cfg.paths.mmproj)
+        if effective_mmproj is not None:
+            ensure_file_exists(effective_mmproj, "Vision projector (mmproj) GGUF")
 
         if not allow_duplicate:
             status = get_server_status(cfg, timeout=1.0)
@@ -777,10 +1125,13 @@ def run_direct(
         attach=attach,
         attach_url=attach_url,
         prompt=prompt,
+        images=images,
         system=system,
         effort=effort,
         lora_scale=lora_scale,
         base_only=base_only,
+        mmproj=mmproj,
+        no_mmproj=no_mmproj,
         ctx_size=ctx_size,
         gpu_layers=gpu_layers,
         flash_attn=flash_attn,

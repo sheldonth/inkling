@@ -90,6 +90,9 @@ def _print_status(status: ServerStatus, cfg: AppConfig, *, as_json: bool = False
             n_ctx = (status.props.get("default_generation_settings") or {}).get("n_ctx")
             if n_ctx:
                 print(f"Context:  {n_ctx} tokens")
+            modalities = status.props.get("modalities") or {}
+            vision_str = "enabled" if modalities.get("vision") else "disabled (no mmproj)"
+            print(f"Vision:   {vision_str}")
         print(f"LoRA:     {format_lora_status(lora_scale)}")
         if status.log_file:
             print(f"Logs:     {status.log_file}")
@@ -112,6 +115,7 @@ def _cmd_start(cfg: AppConfig, args: argparse.Namespace) -> int:
     extra = list(args.extra_args or [])
     if extra and extra[0] == "--":
         extra = extra[1:]
+    mmproj = Path(args.mmproj).expanduser().resolve() if args.mmproj else None
     result = start_server(
         cfg,
         foreground=args.foreground,
@@ -127,6 +131,8 @@ def _cmd_start(cfg: AppConfig, args: argparse.Namespace) -> int:
         lora_scale=lora_scale,
         base_only=args.base,
         no_lora=args.no_lora,
+        mmproj=mmproj,
+        no_mmproj=args.no_mmproj,
         reasoning_effort=args.effort,
         temperature=args.temp,
         extra_args=extra,
@@ -248,6 +254,7 @@ def _read_system_prompt(args: argparse.Namespace) -> str | None:
 def _cmd_ask(cfg: AppConfig, args: argparse.Namespace) -> int:
     prompt = " ".join(args.prompt).strip()
     files = [Path(p).expanduser() for p in (args.file or [])]
+    images = [Path(p).expanduser() for p in (args.image or [])]
     lora_scale = parse_lora_scale_arg(args.lora_scale) if args.lora_scale is not None else None
     show_thinking = True if args.show_thinking else (False if args.hide_thinking else None)
     auto_start = True if args.autostart else (False if args.no_autostart else None)
@@ -256,6 +263,7 @@ def _cmd_ask(cfg: AppConfig, args: argparse.Namespace) -> int:
         cfg,
         prompt=prompt,
         files=files,
+        images=images,
         system=_read_system_prompt(args),
         effort=args.effort,
         lora_scale=lora_scale,
@@ -279,11 +287,13 @@ def _cmd_chat(cfg: AppConfig, args: argparse.Namespace) -> int:
     lora_scale = parse_lora_scale_arg(args.lora_scale) if args.lora_scale is not None else None
     show_thinking = True if args.show_thinking else (False if args.hide_thinking else None)
     auto_start = True if args.autostart else (False if args.no_autostart else None)
+    images = [Path(p).expanduser() for p in (args.image or [])]
     initial_prompt = " ".join(args.prompt).strip() if args.prompt else None
 
     return run_chat(
         cfg,
         system=_read_system_prompt(args),
+        images=images,
         effort=args.effort,
         lora_scale=lora_scale,
         base_only=args.base,
@@ -302,6 +312,8 @@ def _cmd_chat(cfg: AppConfig, args: argparse.Namespace) -> int:
 
 def _cmd_direct(cfg: AppConfig, args: argparse.Namespace) -> int:
     lora_scale = parse_lora_scale_arg(args.lora_scale) if args.lora_scale is not None else None
+    mmproj = Path(args.mmproj).expanduser().resolve() if args.mmproj else None
+    images = [Path(p).expanduser() for p in (args.image or [])]
     extra = list(args.extra_args or [])
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -311,10 +323,13 @@ def _cmd_direct(cfg: AppConfig, args: argparse.Namespace) -> int:
         attach=args.attach,
         allow_duplicate=args.allow_duplicate,
         prompt=args.prompt,
+        images=images,
         system=_read_system_prompt(args),
         effort=args.effort,
         lora_scale=lora_scale,
         base_only=args.base,
+        mmproj=mmproj,
+        no_mmproj=args.no_mmproj,
         ctx_size=args.ctx_size,
         gpu_layers=args.gpu_layers,
         flash_attn=args.flash_attn,
@@ -425,6 +440,10 @@ def _cmd_config(cfg: AppConfig, args: argparse.Namespace) -> int:
         "paths": {
             "model": {"path": str(cfg.paths.model), "exists": cfg.paths.model.is_file()},
             "lora": {"path": str(cfg.paths.lora), "exists": cfg.paths.lora.is_file()},
+            "mmproj": {
+                "path": str(cfg.paths.mmproj) if cfg.paths.mmproj else None,
+                "exists": bool(cfg.paths.mmproj and cfg.paths.mmproj.is_file()),
+            },
             "llama_cli": {"path": str(cfg.paths.llama_cli), "exists": cfg.paths.llama_cli.is_file()},
             "llama_server": {"path": str(cfg.paths.llama_server), "exists": cfg.paths.llama_server.is_file()},
             "harness_bin": {"path": str(cfg.paths.harness_bin), "exists": cfg.paths.harness_bin.is_file()},
@@ -464,6 +483,12 @@ def _cmd_config(cfg: AppConfig, args: argparse.Namespace) -> int:
         entry = info["paths"][key]
         mark = "ok" if entry["exists"] else "MISSING"
         print(f"{key:13s} [{mark}] {entry['path']}")
+    mm_entry = info["paths"]["mmproj"]
+    if mm_entry["path"]:
+        mark = "ok" if mm_entry["exists"] else "MISSING"
+        print(f"{'mmproj':13s} [{mark}] {mm_entry['path']}")
+    else:
+        print(f"{'mmproj':13s} [none] (optional — add *mmproj*.gguf to enable image vision)")
     print(f"Server URL:   {cfg.server_base_url} (API: {cfg.api_base_url}, alias: {cfg.server.alias})")
     print(f"LoRA scale:   {format_lora_status(cfg.lora.scale)}")
     print(
@@ -528,6 +553,8 @@ def _add_server_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lora-scale", help="Initial LoRA scale (float or on/off/base)")
     parser.add_argument("--base", action="store_true", help="Start with LoRA loaded at scale 0.0 (base model)")
     parser.add_argument("--no-lora", action="store_true", help="Do not load the LoRA adapter at all")
+    parser.add_argument("--mmproj", help="Path to vision projector (mmproj) GGUF for image inputs")
+    parser.add_argument("--no-mmproj", action="store_true", help="Disable auto-detected mmproj vision projector")
     parser.add_argument("-e", "--effort", choices=EFFORT_LEVELS, help="Default reasoning effort")
     parser.add_argument("--temp", type=float, help="Default sampling temperature")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Extra arguments passed to llama-server")
@@ -597,18 +624,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_lora.add_argument("--id", dest="adapter_id", type=int, default=0, help="LoRA adapter index (default: 0)")
     p_lora.set_defaults(func=_cmd_lora)
 
-    p_ask = sub.add_parser("ask", aliases=["p", "prompt"], help="Fast one-shot prompt (supports stdin piping & -f files)")
+    p_ask = sub.add_parser("ask", aliases=["p", "prompt"], help="Fast one-shot prompt (supports stdin piping, -f files, & -i images)")
     _add_generation_flags(p_ask)
     p_ask.add_argument("-f", "--file", action="append", help="Attach a text file to the prompt (repeatable)")
+    p_ask.add_argument("-i", "--image", action="append", help="Attach an image file (repeatable)")
     p_ask.add_argument("--seed", type=int, help="RNG seed")
     p_ask.add_argument("--no-stream", action="store_true", help="Wait for complete response instead of streaming")
     p_ask.add_argument("--json", action="store_true", help="Output structured JSON response")
     p_ask.add_argument("--direct", action="store_true", help="Run standalone llama-cli directly instead of using server")
-    p_ask.add_argument("prompt", nargs="*", help="Prompt text (optional if piping stdin or passing -f)")
+    p_ask.add_argument("prompt", nargs="*", help="Prompt text (optional if piping stdin or passing -f/-i)")
     p_ask.set_defaults(func=_cmd_ask)
 
-    p_chat = sub.add_parser("chat", help="Interactive streaming chat against the persistent server")
+    p_chat = sub.add_parser("chat", help="Interactive streaming chat against the persistent server (supports drag-and-drop images)")
     _add_generation_flags(p_chat)
+    p_chat.add_argument("-i", "--image", action="append", help="Pre-stage an image file (repeatable)")
     p_chat.add_argument("--native", action="store_true", help="Attach native llama-cli TUI to the running server")
     p_chat.add_argument("prompt", nargs="*", help="Optional initial message")
     p_chat.set_defaults(func=_cmd_chat)
@@ -636,6 +665,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_direct.add_argument("-e", "--effort", choices=EFFORT_LEVELS, help="Reasoning effort level")
     p_direct.add_argument("--lora-scale", help="LoRA scale (float or on/off/base)")
     p_direct.add_argument("--base", action="store_true", help="Run base model without LoRA")
+    p_direct.add_argument("--mmproj", help="Path to vision projector (mmproj) GGUF")
+    p_direct.add_argument("--no-mmproj", action="store_true", help="Disable auto-detected mmproj vision projector")
+    p_direct.add_argument("-i", "--image", action="append", help="Attach an image file (repeatable)")
     p_direct.add_argument("-c", "--ctx-size", type=int, help="Context window size")
     p_direct.add_argument("-ngl", "--gpu-layers", help="GPU layers ('all', 'auto', or integer)")
     p_direct.add_argument("-fa", "--flash-attn", choices=("on", "off", "auto"), help="Flash Attention mode")

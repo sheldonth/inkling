@@ -130,7 +130,7 @@ Keybinds & slash commands inside `inkling code`:
 ./inkling ask --lora-scale 0.75 "Your prompt"
 ```
 
-### 3. Fast One-Shot, Piping & Chat (`ask` / `chat`)
+### 3. Fast One-Shot, Piping, Chat & Drag-and-Drop Images (`ask` / `chat`)
 
 When stdout is piped or redirected, thinking output is omitted from stdout so shell pipelines only receive the final answer.
 
@@ -140,9 +140,17 @@ When stdout is piped or redirected, thinking output is omitted from stdout so sh
 ./inkling ask -e high --stats "Prove why sqrt(2) is irrational"
 ./inkling ask --json "Return a short greeting"
 cat error.log | ./inkling ask "What caused this crash?"
-./inkling chat                     # Streaming REPL with readline history & slash commands
+./inkling ask -i screenshot.png "What does this error say?"
+./inkling chat                     # Streaming REPL with readline history, drag-and-drop images, & slash commands
 ./inkling chat --native            # Attach native llama-cli TUI to the running server
 ```
+
+**Image / Vision support in `inkling chat` (and `inkling ask`):**
+- Drop Inkling-2-Mini's vision projector (`*mmproj*.gguf`) into the repo root (auto-detected automatically, or set `paths.mmproj` in `inkling.toml` / pass `--mmproj FILE`), then run `./inkling restart`.
+- Inside `inkling chat`, **drag and drop any image file** (`.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.heic`, `.tiff` — macOS automatically converts `.heic`/`.webp`/`.tiff` via `sips`) straight into the `you> ` prompt:
+  - Drop image(s) by themselves and hit Enter to stage them (`[1 img] you> `), then type your question (or press Enter again to send immediately).
+  - Or drop an image inline alongside your question on the same line.
+  - Use `/image <path>` or `/images [clear]` to manage staged images manually.
 
 ### 4. Web UI & OpenAI-Compatible API (`ui` / `env`)
 
