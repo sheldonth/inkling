@@ -8,6 +8,7 @@ use crate::api::{
     is_context_overflow_error, ApiClient, ChatRequestOptions, Message, StreamDelta, Timings, Usage,
 };
 use crate::config::{EffortLevel, HarnessConfig, PermissionMode};
+use crate::images::{encode_image_data_url, extract_dropped_images};
 use crate::prompt::{build_system_prompt, inspect_workspace};
 use crate::session::{
     compact_messages_emergency, compact_messages_light, estimate_request_tokens,
@@ -531,12 +532,43 @@ pub async fn run_agent_turn(
 }
 
 /// Non-TUI headless execution (`inkling code --exec "prompt"`) for scripting & verification.
-pub async fn run_headless(api: ApiClient, cfg: HarnessConfig, prompt: String) -> Result<i32> {
+pub async fn run_headless(
+    api: ApiClient,
+    cfg: HarnessConfig,
+    prompt: String,
+    initial_images: Vec<std::path::PathBuf>,
+    has_vision: bool,
+) -> Result<i32> {
     let control = Arc::new(Mutex::new(SharedControl::new(cfg.mode)));
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    let history = vec![Message::user(prompt)];
+    let (cleaned, dropped) = extract_dropped_images(&prompt, &cfg.workspace);
+    let mut all_images = initial_images;
+    for p in dropped {
+        if !all_images.contains(&p) {
+            all_images.push(p);
+        }
+    }
+
+    let user_msg = if all_images.is_empty() {
+        Message::user(cleaned)
+    } else {
+        if !has_vision {
+            anyhow::bail!(
+                "Image input requires Inkling-2-Mini's vision projector (`mmproj`) GGUF.\n\
+                 Drop an `*mmproj*.gguf` into the repo root (or set `paths.mmproj` in inkling.toml) and run `inkling restart`."
+            );
+        }
+        let mut urls = Vec::with_capacity(all_images.len());
+        for path in &all_images {
+            let (url, _) = encode_image_data_url(path)?;
+            urls.push(url);
+        }
+        Message::user_multimodal(cleaned, urls)
+    };
+
+    let history = vec![user_msg];
     let show_thinking = cfg.show_thinking;
     let handle = tokio::spawn(run_agent_turn(api, cfg, control, history, cancel_rx, tx));
 

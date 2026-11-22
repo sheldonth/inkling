@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod config;
+mod images;
 mod prompt;
 mod session;
 mod tools;
@@ -84,6 +85,10 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_steps: usize,
 
+    /// Attach an image file (repeatable)
+    #[arg(short = 'i', long)]
+    image: Vec<PathBuf>,
+
     /// Run a single prompt non-interactively without TUI (great for scripting/CI)
     #[arg(long)]
     exec: Option<String>,
@@ -152,6 +157,7 @@ async fn main() -> Result<()> {
         .and_then(|p| p.model_alias.clone())
         .unwrap_or(default_model);
     let ctx_size_hint = props.as_ref().and_then(|p| p.n_ctx).unwrap_or(32768);
+    let has_vision = props.as_ref().map(|p| p.has_vision).unwrap_or(false);
 
     let cfg = HarnessConfig {
         server_url,
@@ -174,7 +180,7 @@ async fn main() -> Result<()> {
     };
 
     if let Some(exec_prompt) = cli.exec {
-        let rc = agent::run_headless(api, cfg, exec_prompt).await?;
+        let rc = agent::run_headless(api, cfg, exec_prompt, cli.image, has_vision).await?;
         std::process::exit(rc);
     }
 
@@ -184,5 +190,13 @@ async fn main() -> Result<()> {
         Some(cli.prompt.join(" "))
     };
 
-    tui::run_tui(api, cfg, server_lora_scale, initial_prompt).await
+    tui::run_tui(
+        api,
+        cfg,
+        server_lora_scale,
+        has_vision,
+        cli.image,
+        initial_prompt,
+    )
+    .await
 }

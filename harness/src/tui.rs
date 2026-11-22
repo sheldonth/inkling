@@ -32,6 +32,10 @@ use crate::api::{ApiClient, Message};
 use crate::config::{
     format_lora_status, parse_lora_scale, EffortLevel, HarnessConfig, PermissionMode,
 };
+use crate::images::{
+    encode_image_data_url, extract_dropped_images, format_size, parse_image_path_token,
+    StagedImage, IMAGE_EXTENSIONS,
+};
 use crate::prompt::{inspect_workspace, WorkspaceInfo};
 use crate::session::{Session, ToolStatus, TranscriptEntry};
 
@@ -39,6 +43,8 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 const SLASH_HINTS: &[(&str, &str)] = &[
     ("/help", "show commands and keybinds"),
+    ("/image", "attach image file (or drag & drop directly)"),
+    ("/images", "list or clear staged images"),
     ("/mode", "set mode: ask | auto-edit | yolo | plan"),
     ("/lora", "set LoRA: on | off | 0.6 | inherit | global <val>"),
     ("/effort", "set reasoning effort: none..max"),
@@ -48,7 +54,7 @@ const SLASH_HINTS: &[(&str, &str)] = &[
     ("/compact", "summarize & compact older conversation turns"),
     ("/clear", "reset conversation history"),
     ("/save", "export session to .md or .json"),
-    ("/status", "inspect server, LoRA, and context"),
+    ("/status", "inspect server, LoRA, vision, and context"),
     ("/exit", "quit inkling code"),
 ];
 
@@ -416,6 +422,8 @@ struct App {
     control: Arc<Mutex<SharedControl>>,
     session: Session,
     composer: Composer,
+    staged_images: Vec<StagedImage>,
+    has_vision: bool,
     server_lora_scale: Option<f32>,
     busy: bool,
     cancel_tx: Option<watch::Sender<bool>>,
@@ -429,19 +437,37 @@ struct App {
 }
 
 impl App {
-    fn new(api: ApiClient, cfg: HarnessConfig, server_lora_scale: Option<f32>) -> Self {
+    fn new(
+        api: ApiClient,
+        cfg: HarnessConfig,
+        server_lora_scale: Option<f32>,
+        has_vision: bool,
+        initial_images: Vec<PathBuf>,
+    ) -> Self {
         let workspace_info = inspect_workspace(&cfg.workspace);
         let control = Arc::new(Mutex::new(SharedControl::new(cfg.mode)));
         let mut session = Session::new();
+        let vision_note = if has_vision {
+            "Vision: on (drag & drop images)"
+        } else {
+            "Vision: off (add *mmproj*.gguf to enable images)"
+        };
         session.push_note(
             format!(
-                "Ready in {} • Mode: {} ({}) • Shift+Tab cycles mode • /help for commands",
+                "Ready in {} • Mode: {} • {} • Shift+Tab cycles mode • /help for commands",
                 cfg.workspace.display(),
                 cfg.mode.label(),
-                cfg.mode.description()
+                vision_note
             ),
             false,
         );
+        let mut staged_images = Vec::new();
+        for p in initial_images {
+            match StagedImage::from_path(p) {
+                Ok(img) => staged_images.push(img),
+                Err(e) => session.push_note(e.to_string(), true),
+            }
+        }
         Self {
             api,
             cfg,
@@ -449,6 +475,8 @@ impl App {
             control,
             session,
             composer: Composer::default(),
+            staged_images,
+            has_vision,
             server_lora_scale,
             busy: false,
             cancel_tx: None,
@@ -460,6 +488,41 @@ impl App {
             spinner_tick: 0,
             should_quit: false,
         }
+    }
+
+    fn stage_image_paths(&mut self, paths: Vec<PathBuf>) -> usize {
+        let mut added = 0usize;
+        for path in paths {
+            if self.staged_images.iter().any(|s| s.path == path) {
+                continue;
+            }
+            match StagedImage::from_path(path) {
+                Ok(img) => {
+                    self.staged_images.push(img);
+                    added += 1;
+                }
+                Err(e) => self.session.push_note(e.to_string(), true),
+            }
+        }
+        added
+    }
+
+    async fn check_vision_ready(&mut self) -> bool {
+        if self.has_vision {
+            return true;
+        }
+        if let Ok(props) = self.api.props().await {
+            self.has_vision = props.has_vision;
+        }
+        if !self.has_vision {
+            self.session.push_note(
+                "Vision is not enabled on llama-server (no `mmproj` projector loaded).\n\
+                 Drop Inkling-2-Mini's `*mmproj*.gguf` into the repo root (or set `paths.mmproj` in inkling.toml) and run `inkling restart`.",
+                true,
+            );
+            return false;
+        }
+        true
     }
 
     fn effective_lora_scale(&self) -> Option<f32> {
@@ -494,15 +557,42 @@ impl App {
         }
     }
 
-    fn start_user_turn(
+    async fn start_user_turn(
         &mut self,
         prompt: String,
         agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        self.session
-            .transcript
-            .push(TranscriptEntry::User { text: prompt.clone() });
-        self.session.messages.push(Message::user(prompt));
+        let images_to_send = self.staged_images.clone();
+        if !images_to_send.is_empty() && !self.check_vision_ready().await {
+            return;
+        }
+
+        let mut encoded_urls = Vec::with_capacity(images_to_send.len());
+        let mut image_names = Vec::with_capacity(images_to_send.len());
+        for img in &images_to_send {
+            match encode_image_data_url(&img.path) {
+                Ok((url, _)) => {
+                    encoded_urls.push(url);
+                    image_names.push(img.name.clone());
+                }
+                Err(e) => {
+                    self.session.push_note(format!("Failed to load image '{}': {e}", img.name), true);
+                    return;
+                }
+            }
+        }
+        self.staged_images.clear();
+
+        self.session.transcript.push(TranscriptEntry::User {
+            text: prompt.clone(),
+            images: image_names,
+        });
+        let user_msg = if encoded_urls.is_empty() {
+            Message::user(prompt)
+        } else {
+            Message::user_multimodal(prompt, encoded_urls)
+        };
+        self.session.messages.push(user_msg);
         self.follow_bottom = true;
         self.busy = true;
 
@@ -693,6 +783,8 @@ impl App {
             "/help" => {
                 self.session.push_note(
                     "Commands:\n\
+                     • /image <path>                              Attach an image (or drag & drop directly)\n\
+                     • /images [clear]                            List or clear staged images (or Ctrl+X)\n\
                      • /mode [ask|auto-edit|yolo|plan]            Switch tool permission mode (or Shift+Tab)\n\
                      • /lora [on|off|base|0.6|inherit|global <v>] Live abliteration LoRA scale\n\
                      • /effort [default|none|minimal|low|medium|high|xhigh|max]\n\
@@ -702,15 +794,70 @@ impl App {
                      • /compact [fast]                            Summarize & compact older turns (auto runs at ~78% ctx)\n\
                      • /clear                                     Clear conversation history\n\
                      • /save <path.md|path.json>                  Export transcript\n\
-                     • /status                                    Inspect server & session state\n\
+                     • /status                                    Inspect server, vision & session state\n\
                      • /exit                                      Quit\n\n\
                      Keybinds:\n\
                      • Enter: send  |  Shift+Enter / Alt+Enter / Ctrl+J / \\+Enter: newline\n\
-                     • Shift+Tab: cycle permission mode  |  Ctrl+T: thinking  |  Ctrl+O: tool output\n\
+                     • Shift+Tab: cycle permission mode  |  Ctrl+T: thinking  |  Ctrl+O: tool output  |  Ctrl+X: clear staged images\n\
                      • PgUp/PgDn / Mouse wheel / Ctrl+U/D: scroll  |  Ctrl+End: jump to bottom\n\
                      • Ctrl+C: cancel active turn (or clear input / exit when idle)",
                     false,
                 );
+            }
+            "/image" => {
+                if arg.is_empty() {
+                    self.session.push_note("Usage: /image <path-to-image>", true);
+                } else if let Some(path) = parse_image_path_token(arg, &self.cfg.workspace) {
+                    let added = self.stage_image_paths(vec![path]);
+                    if added > 0 {
+                        if let Some(last) = self.staged_images.last() {
+                            self.session.push_note(
+                                format!(
+                                    "Staged image: {} ({}) [{} staged]",
+                                    last.name,
+                                    format_size(last.size_bytes),
+                                    self.staged_images.len()
+                                ),
+                                false,
+                            );
+                        }
+                        if !self.has_vision {
+                            let _ = self.check_vision_ready().await;
+                        }
+                    }
+                } else {
+                    self.session.push_note(
+                        format!(
+                            "Not a valid existing image file: {arg}\nSupported formats: {}",
+                            IMAGE_EXTENSIONS.join(", ")
+                        ),
+                        true,
+                    );
+                }
+            }
+            "/images" => {
+                if arg.eq_ignore_ascii_case("clear") {
+                    self.staged_images.clear();
+                    self.session.push_note("Cleared staged images.", false);
+                } else if self.staged_images.is_empty() {
+                    self.session.push_note("No staged images.", false);
+                } else {
+                    let list: Vec<String> = self
+                        .staged_images
+                        .iter()
+                        .enumerate()
+                        .map(|(i, img)| {
+                            format!(
+                                "{}. {} ({}) — {}",
+                                i + 1,
+                                img.name,
+                                format_size(img.size_bytes),
+                                img.path.display()
+                            )
+                        })
+                        .collect();
+                    self.session.push_note(list.join("\n"), false);
+                }
             }
             "/mode" => {
                 if arg.is_empty() {
@@ -899,6 +1046,7 @@ impl App {
             }
             "/clear" => {
                 self.session.clear();
+                self.staged_images.clear();
                 self.scroll_offset = 0;
                 self.follow_bottom = true;
                 self.session.push_note("Conversation cleared.", false);
@@ -931,6 +1079,9 @@ impl App {
                 if let Ok(adapters) = self.api.get_lora_adapters().await {
                     self.server_lora_scale = adapters.first().map(|a| a.scale);
                 }
+                if let Ok(props) = self.api.props().await {
+                    self.has_vision = props.has_vision;
+                }
                 let m = self.current_mode();
                 let allowed: Vec<String> = self
                     .control
@@ -944,14 +1095,17 @@ impl App {
                     format!(
                         "Server:    {} ({health})\n\
                          Model:     {}\n\
+                         Vision:    {}\n\
                          Workspace: {}\n\
                          Mode:      {} ({})\n\
                          LoRA:      {}\n\
                          Effort:    {}\n\
                          Context:   ~{} / {} tokens (auto-compacts at ~78%)\n\
+                         Images:    {} staged\n\
                          Allowed:   {}",
                         self.api.base_url(),
                         self.cfg.model,
+                        if self.has_vision { "enabled" } else { "disabled (no mmproj)" },
                         self.cfg.workspace.display(),
                         m.label(),
                         m.description(),
@@ -959,6 +1113,7 @@ impl App {
                         self.cfg.effort,
                         self.session.estimated_tokens(),
                         self.cfg.ctx_size_hint,
+                        self.staged_images.len(),
                         if allowed.is_empty() {
                             "(none)".to_string()
                         } else {
@@ -1074,6 +1229,13 @@ impl App {
                 self.cfg.expand_tools = !self.cfg.expand_tools;
                 return;
             }
+            (KeyCode::Char('x'), m) if m.contains(KeyModifiers::CONTROL) => {
+                if !self.staged_images.is_empty() {
+                    self.staged_images.clear();
+                    self.session.push_note("Cleared staged images.", false);
+                }
+                return;
+            }
             (KeyCode::PageUp, _) => {
                 self.scroll_up(14);
                 return;
@@ -1118,6 +1280,9 @@ impl App {
                 }
                 let submitted = self.composer.take_submitted();
                 if submitted.is_empty() {
+                    if !self.staged_images.is_empty() && !self.busy {
+                        self.start_user_turn(String::new(), agent_tx).await;
+                    }
                     return;
                 }
                 if is_slash_command_input(&submitted) {
@@ -1134,13 +1299,30 @@ impl App {
                     } else {
                         self.handle_slash_command(&submitted).await;
                     }
-                } else if self.busy {
+                    return;
+                }
+
+                // Extract any drag-and-dropped image paths from the submitted text.
+                let (cleaned_text, dropped_imgs) =
+                    extract_dropped_images(&submitted, &self.cfg.workspace);
+                if !dropped_imgs.is_empty() {
+                    self.stage_image_paths(dropped_imgs);
+                    if !self.has_vision {
+                        let _ = self.check_vision_ready().await;
+                    }
+                    // If ONLY image path(s) were dropped, stage them cleanly so the user can type a question.
+                    if cleaned_text.is_empty() {
+                        return;
+                    }
+                }
+
+                if self.busy {
                     self.session.push_note(
                         "Agent is busy — wait for completion or press Ctrl+C / Esc to cancel.",
                         false,
                     );
                 } else {
-                    self.start_user_turn(submitted, agent_tx);
+                    self.start_user_turn(cleaned_text, agent_tx).await;
                 }
             }
             (KeyCode::Backspace, m) if m.contains(KeyModifiers::ALT) => {
@@ -1201,12 +1383,14 @@ impl App {
 
         let show_slash_hint = is_slash_command_input(&self.composer.text);
         let hint_height = if show_slash_hint { 1 } else { 0 };
+        let image_bar_height = if self.staged_images.is_empty() { 0 } else { 1 };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),                         // header
                 Constraint::Min(5),                            // transcript
+                Constraint::Length(image_bar_height),          // staged images strip
                 Constraint::Length(hint_height),               // slash autocomplete hint
                 Constraint::Length(composer_visible_rows + 2), // auto-expanding composer
                 Constraint::Length(1),                         // footer
@@ -1215,15 +1399,44 @@ impl App {
 
         self.render_header(frame, chunks[0]);
         self.render_transcript(frame, chunks[1]);
-        if show_slash_hint {
-            self.render_slash_hint(frame, chunks[2]);
+        if image_bar_height > 0 {
+            self.render_staged_images_bar(frame, chunks[2]);
         }
-        self.render_composer(frame, chunks[3], &visual_rows);
-        self.render_footer(frame, chunks[4]);
+        if show_slash_hint {
+            self.render_slash_hint(frame, chunks[3]);
+        }
+        self.render_composer(frame, chunks[4], &visual_rows);
+        self.render_footer(frame, chunks[5]);
 
         if self.pending_approval.is_some() {
             self.render_approval_modal(frame, area);
         }
+    }
+
+    fn render_staged_images_bar(&self, frame: &mut Frame, area: Rect) {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            " 🖼 Images: ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        for (idx, img) in self.staged_images.iter().enumerate() {
+            if idx > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!(" {} ({}) ", img.name, format_size(img.size_bytes)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(
+            "   (Enter to send • Ctrl+X to clear)",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1264,6 +1477,11 @@ impl App {
             ),
             Span::styled("  │  effort: ", Style::default().fg(Color::DarkGray)),
             Span::styled(self.cfg.effort.as_str(), Style::default().fg(Color::Yellow)),
+            Span::styled("  │  vision: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.has_vision { "on" } else { "off" },
+                Style::default().fg(if self.has_vision { Color::Green } else { Color::DarkGray }),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(line).style(Style::default().bg(Color::Rgb(24, 28, 36))),
@@ -1277,10 +1495,30 @@ impl App {
 
         for entry in &self.session.transcript {
             match entry {
-                TranscriptEntry::User { text } => {
+                TranscriptEntry::User { text, images } => {
                     lines.push(Line::from(""));
+                    if !images.is_empty() {
+                        let mut img_spans = vec![Span::styled(
+                            "❯ ",
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        )];
+                        for (idx, name) in images.iter().enumerate() {
+                            if idx > 0 {
+                                img_spans.push(Span::raw(" "));
+                            }
+                            img_spans.push(Span::styled(
+                                format!(" 🖼 {name} "),
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Cyan),
+                            ));
+                        }
+                        lines.push(Line::from(img_spans));
+                    }
                     for (idx, l) in text.lines().enumerate() {
-                        let prefix = if idx == 0 { "❯ " } else { "  " };
+                        let prefix = if idx == 0 && images.is_empty() { "❯ " } else { "  " };
                         lines.push(Line::from(vec![
                             Span::styled(
                                 prefix,
@@ -1894,16 +2132,22 @@ pub async fn run_tui(
     api: ApiClient,
     cfg: HarnessConfig,
     server_lora_scale: Option<f32>,
+    has_vision: bool,
+    initial_images: Vec<PathBuf>,
     initial_prompt: Option<String>,
 ) -> Result<()> {
     let (_guard, mut terminal) = TerminalGuard::enter()?;
 
-    let mut app = App::new(api, cfg, server_lora_scale);
+    let mut app = App::new(api, cfg, server_lora_scale, has_vision, initial_images);
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
 
     if let Some(prompt) = initial_prompt {
-        if !prompt.trim().is_empty() {
-            app.start_user_turn(prompt, &agent_tx);
+        let (cleaned, dropped) = extract_dropped_images(&prompt, &app.cfg.workspace);
+        if !dropped.is_empty() {
+            app.stage_image_paths(dropped);
+        }
+        if !cleaned.trim().is_empty() || !app.staged_images.is_empty() {
+            app.start_user_turn(cleaned, &agent_tx).await;
         }
     }
 
@@ -1930,7 +2174,21 @@ pub async fn run_tui(
                     Event::Key(key) => app.handle_key(key, &agent_tx).await,
                     Event::Paste(pasted) => {
                         if app.pending_approval.is_none() {
-                            app.composer.insert_str(&pasted);
+                            // Drag-and-drop in macOS terminals arrives via bracketed paste:
+                            // immediately turn dropped image paths into clean staged pills!
+                            let (remaining, dropped) =
+                                extract_dropped_images(&pasted, &app.cfg.workspace);
+                            if !dropped.is_empty() {
+                                app.stage_image_paths(dropped);
+                                if !app.has_vision {
+                                    let _ = app.check_vision_ready().await;
+                                }
+                                if !remaining.is_empty() {
+                                    app.composer.insert_str(&remaining);
+                                }
+                            } else {
+                                app.composer.insert_str(&pasted);
+                            }
                         }
                     }
                     Event::Mouse(mouse) => match mouse.kind {

@@ -24,10 +24,105 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            Self::Parts(_) => None,
+        }
+    }
+
+    pub fn as_text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Text(s) => Some(s),
+            Self::Parts(_) => None,
+        }
+    }
+
+    /// Estimate token cost accurately (avoiding treating raw image base64 bytes as text tokens).
+    pub fn estimated_tokens(&self) -> usize {
+        match self {
+            Self::Text(s) => s.len() / 3,
+            Self::Parts(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    ContentPart::Text { text } => text.len() / 3,
+                    ContentPart::ImageUrl { .. } => 768,
+                })
+                .sum(),
+        }
+    }
+
+    /// Concise human-readable text rendering for LLM summary compaction (never dumps base64).
+    pub fn summary_text(&self, max_chars: usize) -> String {
+        match self {
+            Self::Text(s) => {
+                let mut out: String = s.chars().take(max_chars).collect();
+                if s.chars().count() > max_chars {
+                    out.push_str(" ...[truncated]");
+                }
+                out
+            }
+            Self::Parts(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        ContentPart::ImageUrl { .. } => out.push_str("[image] "),
+                        ContentPart::Text { text } => out.push_str(text),
+                    }
+                }
+                let mut trimmed: String = out.chars().take(max_chars).collect();
+                if out.chars().count() > max_chars {
+                    trimmed.push_str(" ...[truncated]");
+                }
+                trimmed
+            }
+        }
+    }
+
+    /// Replace embedded base64 images with compact text placeholders during compaction.
+    pub fn strip_images(&mut self) -> usize {
+        if let Self::Parts(parts) = self {
+            let mut removed = 0usize;
+            for p in parts.iter_mut() {
+                if matches!(p, ContentPart::ImageUrl { .. }) {
+                    *p = ContentPart::Text {
+                        text: "[earlier image omitted during compaction]".to_string(),
+                    };
+                    removed += 1;
+                }
+            }
+            return removed;
+        }
+        0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,7 +137,7 @@ impl Message {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -53,7 +148,30 @@ impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn user_multimodal(text: String, image_data_urls: Vec<String>) -> Self {
+        if image_data_urls.is_empty() {
+            return Self::user(text);
+        }
+        let mut parts: Vec<ContentPart> = image_data_urls
+            .into_iter()
+            .map(|url| ContentPart::ImageUrl {
+                image_url: ImageUrl { url },
+            })
+            .collect();
+        if !text.trim().is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        Self {
+            role: "user".to_string(),
+            content: Some(MessageContent::Parts(parts)),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -69,7 +187,7 @@ impl Message {
         let content_opt = if content.is_empty() && !tool_calls.is_empty() {
             None
         } else {
-            Some(content)
+            Some(MessageContent::Text(content))
         };
         let reasoning_opt = if reasoning.is_empty() {
             None
@@ -98,7 +216,7 @@ impl Message {
     ) -> Self {
         Self {
             role: "tool".to_string(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
@@ -143,6 +261,7 @@ pub struct LoraAdapter {
 pub struct ServerProps {
     pub model_alias: Option<String>,
     pub n_ctx: Option<usize>,
+    pub has_vision: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +375,15 @@ impl ApiClient {
             .pointer("/default_generation_settings/n_ctx")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
-        Ok(ServerProps { model_alias, n_ctx })
+        let has_vision = body
+            .pointer("/modalities/vision")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(ServerProps {
+            model_alias,
+            n_ctx,
+            has_vision,
+        })
     }
 
     pub async fn get_lora_adapters(&self) -> Result<Vec<LoraAdapter>> {

@@ -414,6 +414,10 @@ def build_code_command(cfg: AppConfig, server_url: str, args: argparse.Namespace
     if sys_prompt:
         cmd.extend(["--system", sys_prompt])
 
+    if getattr(args, "image", None):
+        for img in args.image:
+            cmd.extend(["--image", str(Path(img).expanduser().resolve())])
+
     if args.exec_prompt:
         cmd.extend(["--exec", args.exec_prompt])
     if args.prompt:
@@ -642,9 +646,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("prompt", nargs="*", help="Optional initial message")
     p_chat.set_defaults(func=_cmd_chat)
 
-    p_code = sub.add_parser("code", aliases=["agent", "tui"], help="Launch the Rust TUI coding agent harness")
+    p_code = sub.add_parser("code", aliases=["agent", "tui"], help="Launch the Rust TUI coding agent harness (supports drag-and-drop images)")
     _add_generation_flags(p_code)
     p_code.add_argument("-w", "--workspace", help="Workspace directory (default: current working directory)")
+    p_code.add_argument("-i", "--image", action="append", help="Pre-stage an image file (repeatable)")
     p_code.add_argument("-m", "--mode", choices=("ask", "auto-edit", "yolo", "plan"), default="ask", help="Permission mode (default: ask)")
     mode_short = p_code.add_mutually_exclusive_group()
     mode_short.add_argument("--yolo", action="store_true", help="Shortcut for --mode yolo")

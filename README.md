@@ -95,10 +95,11 @@ Press **`Shift+Tab`** anytime to cycle permission modes:
 
 Keybinds & slash commands inside `inkling code`:
 - **`Enter`**: send | **`Shift+Enter` / `Alt+Enter` / `Ctrl+J` / `\`+Enter**: newline *(for native `Shift+Enter` inside `tmux`, add `set -s extended-keys on` to `~/.tmux.conf`)*
-- **`Ctrl+C` / `Esc`**: cancel active turn | **`Ctrl+T`**: expand/collapse thinking blocks | **`Ctrl+O`**: expand/collapse tool outputs
+- **`Ctrl+C` / `Esc`**: cancel active turn | **`Ctrl+T`**: expand/collapse thinking blocks | **`Ctrl+O`**: expand/collapse tool outputs | **`Ctrl+X`**: clear staged images
 - **`PgUp` / `PgDn` / Mouse wheel**: scroll transcript | **`Ctrl+End`**: jump to bottom
-- **Auto-compaction**: Automatically strips old thinking/tool outputs, summarizes older turns at ~78% context usage, and recovers/retries automatically if the server ever hits its context limit.
-- Slash commands: `/mode`, `/lora [on|off|0.6|inherit|global <val>]`, `/effort [none..max]`, `/diff`, `/compact [fast]`, `/clear`, `/save <file.md|file.json>`, `/status`, `/help`, `/exit`
+- **Drag-and-drop images**: Drag image files directly onto the TUI (immediately turns into clean staged pills above the prompt without cluttering the text box; auto-converts `.heic`/`.webp`/`.tiff` on macOS via `sips`; requires an `*mmproj*.gguf` loaded on `llama-server`).
+- **Auto-compaction**: Automatically strips old thinking/tool outputs & old embedded images, summarizes older turns at ~78% context usage, and recovers/retries automatically if the server ever hits its context limit.
+- Slash commands: `/image <path>`, `/images [clear]`, `/mode`, `/lora [on|off|0.6|inherit|global <val>]`, `/effort [none..max]`, `/diff`, `/compact [fast]`, `/clear`, `/save <file.md|file.json>`, `/status`, `/help`, `/exit`
 
 ---
 

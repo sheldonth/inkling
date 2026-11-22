@@ -19,6 +19,7 @@ pub enum ToolStatus {
 pub enum TranscriptEntry {
     User {
         text: String,
+        images: Vec<String>,
     },
     Assistant {
         reasoning: String,
@@ -51,16 +52,17 @@ pub struct Session {
     pub last_gen_tps: f64,
 }
 
-/// Conservative token estimate for a single message (chars / 3 + framing overhead).
+/// Conservative token estimate for a single message (chars / 3 + framing overhead;
+/// multimodal images count ~768 tokens each instead of raw base64 length).
 pub fn estimate_message_tokens(msg: &Message) -> usize {
-    let chars = msg.content.as_deref().map_or(0, str::len)
-        + msg.reasoning_content.as_deref().map_or(0, str::len)
+    let content_toks = msg.content.as_ref().map_or(0, |c| c.estimated_tokens());
+    let extra_chars = msg.reasoning_content.as_deref().map_or(0, str::len)
         + msg.tool_calls.as_ref().map_or(0, |tcs| {
             tcs.iter()
                 .map(|t| t.function.name.len() + t.function.arguments.len() + 24)
                 .sum()
         });
-    (chars / 3) + 12
+    content_toks + (extra_chars / 3) + 12
 }
 
 /// Conservative total token estimate including system prompt + tool definitions overhead.
@@ -111,17 +113,25 @@ pub fn compact_messages_light(messages: &mut [Message], keep_recent: usize) -> (
         }
     }
 
-    // Trim bulky tool outputs older than `keep_recent`.
+    // Trim bulky tool outputs and old base64 images older than `keep_recent`.
     let tool_cutoff = messages.len().saturating_sub(keep_recent);
     for msg in &mut messages[..tool_cutoff] {
         if msg.role == "tool" {
-            if let Some(content) = &mut msg.content {
+            if let Some(content) = msg.content.as_mut().and_then(|c| c.as_text_mut()) {
                 if content.len() > 600 {
                     let before = content.len();
                     let head: String = content.chars().take(300).collect();
                     *content = format!("{head}\n... [compacted {before} chars]");
                     freed += before.saturating_sub(content.len());
                     trimmed += 1;
+                }
+            }
+        } else if msg.role == "user" {
+            if let Some(content) = msg.content.as_mut() {
+                let removed = content.strip_images();
+                if removed > 0 {
+                    trimmed += removed;
+                    freed += removed * 2048;
                 }
             }
         }
@@ -149,12 +159,16 @@ pub fn compact_messages_emergency(
     let last_idx = messages.len().saturating_sub(1);
     for (idx, msg) in messages.iter_mut().enumerate() {
         if idx < last_idx && msg.role == "tool" {
-            if let Some(c) = &mut msg.content {
+            if let Some(c) = msg.content.as_mut().and_then(|m| m.as_text_mut()) {
                 if c.len() > 300 {
                     let len = c.len();
                     let preview: String = c.chars().take(180).collect();
                     *c = format!("{preview}\n... [compacted {len} chars]");
                 }
+            }
+        } else if idx < last_idx && msg.role == "user" {
+            if let Some(c) = msg.content.as_mut() {
+                c.strip_images();
             }
         }
     }
@@ -176,7 +190,7 @@ pub fn compact_messages_emergency(
                     .take(messages.len().saturating_sub(1))
                     .max_by_key(|(_, m)| estimate_message_tokens(m))
                 {
-                    if let Some(c) = &mut messages[idx].content {
+                    if let Some(c) = messages[idx].content.as_mut().and_then(|m| m.as_text_mut()) {
                         if c.len() > 400 {
                             let half = c.chars().count() / 2;
                             let kept: String = c.chars().take(half).collect();
@@ -197,7 +211,8 @@ pub fn compact_messages_emergency(
         // Only prepend notice if the first remaining message is not already a compaction notice.
         let already_noted = messages
             .first()
-            .and_then(|m| m.content.as_deref())
+            .and_then(|m| m.content.as_ref())
+            .and_then(|c| c.as_text())
             .map(|c| c.starts_with("[Context auto-compacted") || c.starts_with("[Compacted conversation"))
             .unwrap_or(false);
         if !already_noted {
@@ -221,11 +236,7 @@ pub fn format_messages_for_summary(messages: &[Message], max_chars: usize) -> St
             piece.push_str(&format!("[{role}] "));
         }
         if let Some(content) = &msg.content {
-            let trimmed: String = content.chars().take(1200).collect();
-            piece.push_str(&trimmed);
-            if content.chars().count() > 1200 {
-                piece.push_str(" ...[truncated]");
-            }
+            piece.push_str(&content.summary_text(1200));
         }
         if let Some(tcs) = &msg.tool_calls {
             for tc in tcs {
@@ -306,10 +317,15 @@ impl Session {
         let mut out = String::from("# Inkling Code Session\n\n");
         for entry in &self.transcript {
             match entry {
-                TranscriptEntry::User { text } => {
+                TranscriptEntry::User { text, images } => {
                     out.push_str("## User\n\n");
-                    out.push_str(text);
-                    out.push_str("\n\n");
+                    for img in images {
+                        out.push_str(&format!("_[attached image: `{img}`]_\n\n"));
+                    }
+                    if !text.is_empty() {
+                        out.push_str(text);
+                        out.push_str("\n\n");
+                    }
                 }
                 TranscriptEntry::Assistant {
                     reasoning,
@@ -392,7 +408,8 @@ mod tests {
         assert!(sess.messages[1].reasoning_content.is_none());
         assert!(sess.messages[2]
             .content
-            .as_deref()
+            .as_ref()
+            .and_then(|c| c.as_text())
             .unwrap()
             .contains("[compacted"));
     }
